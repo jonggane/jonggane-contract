@@ -20,4 +20,9 @@ interface IProductManager {
         external
         view
         returns (uint256, uint256);
+
+    function getMinimumCollateral(uint256 _productId, uint256 _notionalValue)
+        external
+        view
+        returns (uint256);
 }

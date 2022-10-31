@@ -26,6 +26,31 @@ contract ProductManager is IProductManager {
         owner = _owner;
     }
 
+    function setFeeRateFactor(uint256 _productId, uint256 _feeRateFactor)
+        external
+        onlyOwner
+    {
+        products[_productId].feeRateFactor = _feeRateFactor;
+    }
+
+    function setMaxLeverage(uint256 _productId, uint256 _maxLeverage)
+        external
+        onlyOwner
+    {
+        products[_productId].maxLeverage = _maxLeverage;
+    }
+
+    function setLiquidationThreshold(
+        uint256 _productId,
+        uint256 _liquidationThreshold
+    ) external onlyOwner {
+        products[_productId].liquidationThreshold = _liquidationThreshold;
+    }
+
+    function setStatus(uint256 _productId, bool _isActive) external onlyOwner {
+        products[_productId].isActive = _isActive;
+    }
+
     function addProduct(
         uint256 _feeRateFactor,
         uint256 _decimal,
@@ -73,5 +98,13 @@ contract ProductManager is IProductManager {
         returns (uint256, uint256)
     {
         return (products[_productId].feeRateFactor, FEE_PRECISION);
+    }
+
+    function getMinimumCollateral(uint256 _productId, uint256 _notionalValue)
+        external
+        view
+        returns (uint256)
+    {
+        return _notionalValue / products[_productId].maxLeverage;
     }
 }

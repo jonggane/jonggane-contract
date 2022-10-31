@@ -13,6 +13,7 @@ import "./interfaces/IPositionManager.sol";
 
 contract PositionManager is ReentrancyGuard, IPositionManager {
     struct Position {
+        address account;
         uint256 productId;
         uint256 notionalValue;
         uint256 size;
@@ -115,25 +116,12 @@ contract PositionManager is ReentrancyGuard, IPositionManager {
         productManager = _productManager;
     }
 
-    function updateFundingFee(address _collateralToken) public {
+    function updateFundingFee(address _collateralToken) external nonReentrant {
         require(
             enabledCollateral[_collateralToken],
             "Invalid Collateral Token"
         );
-
-        FundingFee memory _fundingFee = fundingFees[_collateralToken];
-        uint256 intervals = (block.timestamp - _fundingFee.lastTime) /
-            fundingInterval;
-        uint256 nextFundingRate = (fundingRateFactor *
-            intervals *
-            reservedAmounts[_collateralToken]) /
-            IERC20(_collateralToken).balanceOf(vault);
-
-        _fundingFee.cumulativeRate += nextFundingRate;
-        _fundingFee.lastTime =
-            (block.timestamp / fundingInterval) *
-            fundingInterval;
-        fundingFees[_collateralToken] = _fundingFee;
+        _updateFundingFee(_collateralToken);
     }
 
     function increasePosition(
@@ -143,24 +131,6 @@ contract PositionManager is ReentrancyGuard, IPositionManager {
         address _collateralToken,
         uint256 _collateralDelta
     ) external nonReentrant {
-        _increasePosition(
-            msg.sender,
-            _productId,
-            _sizeDelta,
-            _isLong,
-            _collateralToken,
-            _collateralDelta
-        );
-    }
-
-    function _increasePosition(
-        address _account,
-        uint256 _productId,
-        uint256 _sizeDelta,
-        bool _isLong,
-        address _collateralToken,
-        uint256 _collateralDelta
-    ) internal {
         require(
             IProductManager(productManager).isProductAcive(_productId),
             "Invalid Product"
@@ -170,77 +140,24 @@ contract PositionManager is ReentrancyGuard, IPositionManager {
             "Invalid Collateral Token"
         );
 
-        updateFundingFee(_collateralToken);
-
-        bytes32 key = getPositionKey(
-            _account,
+        FundingFee memory fundingFee = _updateFundingFee(_collateralToken);
+        bytes32 positionKey = _initializePosition(
+            msg.sender,
             _productId,
-            _collateralToken,
-            _isLong
-        );
-
-        Position memory position = positions[key];
-
-        uint256 notionalValueDelta = productToUSD(_productId, _sizeDelta);
-        uint256 fee = calculateTradeFee(_productId, notionalValueDelta);
-        fee += calculateFundingFee(position);
-        fee = usdToToken(fee, _collateralToken);
-
-        position.productId = _productId;
-        position.notionalValue += notionalValueDelta;
-        position.size += _sizeDelta;
-        position.collateralAmount += _collateralDelta;
-        position.collateralAmount -= fee;
-        position.collateralToken = _collateralToken;
-        position.isLong = _isLong;
-        position.fundingFee = fundingFees[_collateralToken];
-
-        // Calculate temporally to get right leverage
-        (uint256 profit, uint256 loss) = getPnL(position, position.size);
-        (profit, loss) = (
-            usdToToken(profit, _collateralToken),
-            usdToToken(loss, _collateralToken)
-        );
-        position.collateralAmount += profit;
-        position.collateralAmount -= loss;
-
-        require(position.size > 0, "Invalid Position Size");
-        require(position.collateralAmount > 0, "Invalid Collateral Amount");
-        require(
-            IProductManager(productManager).isInMaxLeverage(
-                _productId,
-                getLeverage(position)
-            ),
-            "Invalid Leverage"
-        );
-
-        // Recalculate after leverage validation
-        position.collateralAmount -= profit;
-        position.collateralAmount += loss;
-
-        reservedAmounts[_collateralToken] += usdToToken(
-            notionalValueDelta,
+            _isLong,
             _collateralToken
         );
+        _addCollateral(positionKey, _collateralDelta);
+        _payFee(positionKey, _sizeDelta);
+        _increaseSize(positionKey, _sizeDelta);
+        _validatePosition(positionKey);
+        _updatePositionFundingFee(positionKey, fundingFee);
 
         require(
             IERC20(_collateralToken).balanceOf(vault) >=
                 reservedAmounts[_collateralToken],
             "Insufficient Vault Balance"
         );
-
-        if (_collateralDelta > 0) {
-            IERC20(_collateralToken).transferFrom(
-                _account,
-                address(this),
-                _collateralDelta
-            );
-        }
-        if (fee > 0) {
-            IERC20(_collateralToken).transfer(vault, fee);
-            IVault(vault).transferIn(_collateralToken, fee);
-        }
-        positions[key] = position;
     }
 
     function decreasePosition(
@@ -250,24 +167,6 @@ contract PositionManager is ReentrancyGuard, IPositionManager {
         address _collateralToken,
         uint256 _collateralDelta
     ) external nonReentrant {
-        _decreasePosition(
-            msg.sender,
-            _productId,
-            _sizeDelta,
-            _isLong,
-            _collateralToken,
-            _collateralDelta
-        );
-    }
-
-    function _decreasePosition(
-        address _account,
-        uint256 _productId,
-        uint256 _sizeDelta,
-        bool _isLong,
-        address _collateralToken,
-        uint256 _collateralDelta
-    ) internal {
         require(
             IProductManager(productManager).isProductAcive(_productId),
             "Invalid Product"
@@ -277,70 +176,74 @@ contract PositionManager is ReentrancyGuard, IPositionManager {
             "Invalid Collateral Token"
         );
 
-        updateFundingFee(_collateralToken);
-
-        bytes32 key = getPositionKey(
-            _account,
+        FundingFee memory fundingFee = _updateFundingFee(_collateralToken);
+        bytes32 positionKey = _initializePosition(
+            msg.sender,
             _productId,
-            _collateralToken,
-            _isLong
-        );
-        Position memory position = positions[key];
-
-        (uint256 profit, uint256 loss) = getPnL(position, _sizeDelta);
-        (profit, loss) = (
-            usdToToken(profit, _collateralToken),
-            usdToToken(loss, _collateralToken)
-        );
-        uint256 notionalValueDelta = (position.notionalValue * _sizeDelta) /
-            position.size;
-        uint256 fee = calculateFundingFee(position);
-        fee += calculateTradeFee(
-            _productId,
-            productToUSD(_productId, _sizeDelta)
-        );
-        fee = usdToToken(fee, _collateralToken);
-
-        position.notionalValue -= notionalValueDelta;
-        position.size -= _sizeDelta;
-        position.collateralAmount -= (_collateralDelta + loss + fee);
-        position.fundingFee = fundingFees[_collateralToken];
-
-        require(
-            IProductManager(productManager).isInLiquidationThreshold(
-                _productId,
-                getLeverage(position)
-            ),
-            "Invalid Leverage"
-        );
-
-        reservedAmounts[_collateralToken] -= usdToToken(
-            notionalValueDelta,
+            _isLong,
             _collateralToken
         );
+        _settlePnl(positionKey, _sizeDelta);
+        _payFee(positionKey, _sizeDelta);
+        _decreaseSize(positionKey, _sizeDelta);
+        _removeCollateral(positionKey, _collateralDelta);
+        _validatePosition(positionKey);
+        _updatePositionFundingFee(positionKey, fundingFee);
+    }
 
-        if (profit > 0) {
-            IVault(vault).transferOut(_collateralToken, profit);
-        }
-        if ((loss + fee) > 0) {
-            IERC20(_collateralToken).transfer(vault, fee);
-            IVault(vault).transferIn(_collateralToken, loss + fee);
-        }
-        if ((profit + _collateralDelta) > 0) {
-            IERC20(_collateralToken).transfer(
-                _account,
-                profit + _collateralDelta
-            );
-        }
-        if (position.size == 0 || position.notionalValue == 0) {
-            IERC20(_collateralToken).transfer(
-                _account,
-                position.collateralAmount
-            );
-            delete positions[key];
-        } else {
-            positions[key] = position;
-        }
+    function addCollateral(
+        uint256 _productId,
+        bool _isLong,
+        address _collateralToken,
+        uint256 _collateralDelta
+    ) external nonReentrant {
+        require(
+            IProductManager(productManager).isProductAcive(_productId),
+            "Invalid Product"
+        );
+        require(
+            enabledCollateral[_collateralToken],
+            "Invalid Collateral Token"
+        );
+
+        FundingFee memory fundingFee = _updateFundingFee(_collateralToken);
+        bytes32 positionKey = _initializePosition(
+            msg.sender,
+            _productId,
+            _isLong,
+            _collateralToken
+        );
+        _addCollateral(positionKey, _collateralDelta);
+        _payFee(positionKey, 0);
+        _updatePositionFundingFee(positionKey, fundingFee);
+    }
+
+    function removeCollateral(
+        uint256 _productId,
+        bool _isLong,
+        address _collateralToken,
+        uint256 _collateralDelta
+    ) external nonReentrant {
+        require(
+            IProductManager(productManager).isProductAcive(_productId),
+            "Invalid Product"
+        );
+        require(
+            enabledCollateral[_collateralToken],
+            "Invalid Collateral Token"
+        );
+
+        FundingFee memory fundingFee = _updateFundingFee(_collateralToken);
+        bytes32 positionKey = _initializePosition(
+            msg.sender,
+            _productId,
+            _isLong,
+            _collateralToken
+        );
+        _payFee(positionKey, 0);
+        _removeCollateral(positionKey, _collateralDelta);
+        _validatePosition(positionKey);
+        _updatePositionFundingFee(positionKey, fundingFee);
     }
 
     function liquidatePosition(
@@ -380,7 +283,7 @@ contract PositionManager is ReentrancyGuard, IPositionManager {
         require(
             IProductManager(productManager).isInLiquidationThreshold(
                 _productId,
-                getLeverage(position)
+                getLeverage(position, 0, 0)
             ),
             "Invalid Leverage"
         );
@@ -396,6 +299,215 @@ contract PositionManager is ReentrancyGuard, IPositionManager {
             _collateralToken
         );
         delete positions[key];
+    }
+
+    function _updateFundingFee(address _collateralToken)
+        internal
+        returns (FundingFee memory)
+    {
+        FundingFee memory _fundingFee = fundingFees[_collateralToken];
+        uint256 intervals = (block.timestamp - _fundingFee.lastTime) /
+            fundingInterval;
+        uint256 nextFundingRate = (fundingRateFactor *
+            intervals *
+            reservedAmounts[_collateralToken]) /
+            IERC20(_collateralToken).balanceOf(vault);
+
+        _fundingFee.cumulativeRate += nextFundingRate;
+        _fundingFee.lastTime =
+            (block.timestamp / fundingInterval) *
+            fundingInterval;
+        fundingFees[_collateralToken] = _fundingFee;
+        return _fundingFee;
+    }
+
+    function _initializePosition(
+        address _account,
+        uint256 _productId,
+        bool _isLong,
+        address _collateralToken
+    ) internal returns (bytes32) {
+        bytes32 key = getPositionKey(
+            _account,
+            _productId,
+            _collateralToken,
+            _isLong
+        );
+        Position memory position = positions[key];
+        position.account = _account;
+        position.productId = _productId;
+        position.isLong = _isLong;
+        position.collateralToken = _collateralToken;
+        positions[key] = position;
+        return key;
+    }
+
+    function _addCollateral(bytes32 positionKey, uint256 _collateralDelta)
+        internal
+    {
+        Position memory position = positions[positionKey];
+        position.collateralAmount += _collateralDelta;
+        require(position.collateralAmount > 0, "Invalid Collateral Amount");
+
+        IERC20(position.collateralToken).transferFrom(
+            position.account,
+            address(this),
+            _collateralDelta
+        );
+        positions[positionKey] = position;
+    }
+
+    function _increaseSize(bytes32 positionKey, uint256 _sizeDelta) internal {
+        Position memory position = positions[positionKey];
+        uint256 notionalValueDelta = productToUSD(
+            position.productId,
+            _sizeDelta
+        );
+
+        position.notionalValue += notionalValueDelta;
+        position.size += _sizeDelta;
+
+        require(position.size > 0, "Invalid Position Size");
+
+        reservedAmounts[position.collateralToken] += usdToToken(
+            notionalValueDelta,
+            position.collateralToken
+        );
+
+        positions[positionKey] = position;
+    }
+
+    function _removeCollateral(bytes32 positionKey, uint256 _collateralDelta)
+        internal
+    {
+        Position memory position = positions[positionKey];
+        if (position.size == 0) return;
+
+        uint256 minimumCollateralAmount = usdToToken(
+            IProductManager(productManager).getMinimumCollateral(
+                position.productId,
+                productToUSD(0, position.size)
+            ),
+            position.collateralToken
+        );
+
+        if (
+            position.collateralAmount >=
+            _collateralDelta + minimumCollateralAmount
+        ) {
+            position.collateralAmount -= _collateralDelta;
+            IERC20(position.collateralToken).transfer(
+                position.account,
+                _collateralDelta
+            );
+            positions[positionKey] = position;
+            return;
+        }
+
+        uint256 deficientTokenAmount = _collateralDelta +
+            minimumCollateralAmount -
+            position.collateralAmount;
+        if (position.isLong) {
+            position.notionalValue += tokenToUSD(
+                position.collateralToken,
+                deficientTokenAmount
+            );
+            reservedAmounts[position.collateralToken] += deficientTokenAmount;
+        } else {
+            position.notionalValue -= tokenToUSD(
+                position.collateralToken,
+                deficientTokenAmount
+            );
+            reservedAmounts[position.collateralToken] -= deficientTokenAmount;
+        }
+        position.collateralAmount = minimumCollateralAmount;
+
+        IVault(vault).transferOut(
+            position.collateralToken,
+            deficientTokenAmount
+        );
+        IERC20(position.collateralToken).transfer(
+            position.account,
+            _collateralDelta
+        );
+        positions[positionKey] = position;
+    }
+
+    function _decreaseSize(bytes32 positionKey, uint256 _sizeDelta) internal {
+        Position memory position = positions[positionKey];
+        uint256 notionalValueDelta = (position.notionalValue * _sizeDelta) /
+            position.size;
+
+        position.notionalValue -= notionalValueDelta;
+        position.size -= _sizeDelta;
+        reservedAmounts[position.collateralToken] -= usdToToken(
+            notionalValueDelta,
+            position.collateralToken
+        );
+
+        if (position.size == 0 || position.notionalValue == 0) {
+            IERC20(position.collateralToken).transfer(
+                position.account,
+                position.collateralAmount
+            );
+            delete positions[positionKey];
+        } else {
+            positions[positionKey] = position;
+        }
+    }
+
+    function _settlePnl(bytes32 positionKey, uint256 _sizeDelta) internal {
+        Position memory position = positions[positionKey];
+        (uint256 profit, uint256 loss) = getPnL(position, _sizeDelta);
+        (profit, loss) = (
+            usdToToken(profit, position.collateralToken),
+            usdToToken(loss, position.collateralToken)
+        );
+
+        IVault(vault).transferOut(position.collateralToken, profit);
+        IERC20(position.collateralToken).transfer(position.account, profit);
+        IVault(vault).transferIn(position.collateralToken, loss);
+        IERC20(position.collateralToken).transfer(vault, loss);
+
+        position.collateralAmount -= loss;
+        positions[positionKey] = position;
+    }
+
+    function _updatePositionFundingFee(
+        bytes32 positionKey,
+        FundingFee memory _fundingFee
+    ) internal {
+        Position storage position = positions[positionKey];
+        position.fundingFee = _fundingFee;
+    }
+
+    function _validatePosition(bytes32 positionKey) internal view {
+        Position memory position = positions[positionKey];
+        (uint256 profit, uint256 loss) = getPnL(position, position.size);
+
+        require(
+            IProductManager(productManager).isInMaxLeverage(
+                position.productId,
+                getLeverage(position, profit, loss)
+            ),
+            "Invalid Leverage"
+        );
+    }
+
+    function _payFee(bytes32 positionKey, uint256 _sizeDelta) internal {
+        Position memory position = positions[positionKey];
+        uint256 fee = usdToToken(
+            calculateTradeFee(
+                position.productId,
+                productToUSD(position.productId, _sizeDelta)
+            ) + calculateFundingFee(position),
+            position.collateralToken
+        );
+
+        IERC20(position.collateralToken).transfer(vault, fee);
+        IVault(vault).transferIn(position.collateralToken, fee);
+        position.collateralAmount -= fee;
+        positions[positionKey] = position;
     }
 
     function getPositionKey(
@@ -521,6 +633,9 @@ contract PositionManager is ReentrancyGuard, IPositionManager {
         view
         returns (uint256 profit, uint256 loss)
     {
+        if (_position.size == 0) {
+            return (0, 0);
+        }
         uint256 targetNotionalValue = (_position.notionalValue * _sizeDelta) /
             _position.size;
         uint256 currentNotionalValue = productToUSD(
@@ -572,21 +687,24 @@ contract PositionManager is ReentrancyGuard, IPositionManager {
         return (_notionalValue * feeRateFactor) / feePrecision;
     }
 
-    function getLeverage(Position memory _position)
-        public
-        view
-        returns (uint256)
-    {
+    function getLeverage(
+        Position memory _position,
+        uint256 _profit,
+        uint256 _loss
+    ) public view returns (uint256) {
         if (_position.size == 0) {
             return 0;
         }
+
         uint256 collateralValue = tokenToUSD(
             _position.collateralToken,
             _position.collateralAmount
         );
+        uint256 positiveValue = collateralValue + _profit;
+
         return
-            collateralValue > 0
-                ? _position.notionalValue / collateralValue
+            positiveValue > _loss
+                ? _position.notionalValue / (positiveValue - _loss)
                 : type(uint256).max;
     }
 
